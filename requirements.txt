@@ -1,0 +1,11 @@
+transformers
+pandas
+torch
+accelerate
+xgboost
+shap
+captum
+fastapi
+uvicorn
+lime
+numpy>=2.2
