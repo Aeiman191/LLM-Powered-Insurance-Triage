@@ -1,16 +1,11 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException
 import pandas as pd
-from io import StringIO
+from io import StringIO, BytesIO
 from transformers import AutoTokenizer, AutoModelForCausalLM
 import torch
 import random
 import numpy as np
-# Ensure 'punkt' is downloaded only once (recommended)
-import nltk
-try:
-    nltk.data.find("tokenizers/punkt")
-except LookupError:
-    nltk.download("punkt")
+
 
 
 app = FastAPI()
@@ -266,24 +261,32 @@ def generate_input_text(row):
 processed_df = pd.DataFrame()
 
 
+
 @app.post("/upload-csv/")
 async def upload_csv(file: UploadFile = File(...)):
     global processed_df
-    if not file.filename.endswith(".csv"):
-        raise HTTPException(status_code=400, detail="Invalid file type. Please upload a CSV file.")
+
+    filename = file.filename.lower()
+    if not (filename.endswith(".csv") or filename.endswith(".xlsx")):
+        raise HTTPException(status_code=400, detail="Invalid file type. Please upload a CSV or XLSX file.")
 
     contents = await file.read()
+
+    # Read the file into a DataFrame
     try:
-        df = pd.read_csv(StringIO(contents.decode("utf-8")))
+        if filename.endswith(".csv"):
+            df = pd.read_csv(StringIO(contents.decode("utf-8")))
+        else:  # .xlsx
+            df = pd.read_excel(BytesIO(contents))
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Error reading CSV: {str(e)}")
+        raise HTTPException(status_code=400, detail=f"Error reading file: {str(e)}")
 
     # Check required columns
     if "ClaimDescription" not in df.columns or "Incurred" not in df.columns:
-        raise HTTPException(status_code=400, detail="CSV must contain 'ClaimDescription' and 'Incurred' columns.")
+        raise HTTPException(status_code=400, detail="File must contain 'ClaimDescription' and 'Incurred' columns.")
 
     # Take a sample for transformation
-    subset_df = df.head(100).copy()
+    subset_df = df.head(50).copy()
 
     # Generate claim descriptions
     subset_df["DetailedClaimDescription"] = subset_df["ClaimDescription"].apply(generate_detailed_description)
@@ -296,16 +299,17 @@ async def upload_csv(file: UploadFile = File(...)):
 
     # Assign severity label
     subset_df["SeverityLabel"] = subset_df.apply(determine_severity, axis=1)
+
     # Generate InputText
     subset_df["InputText"] = subset_df.apply(generate_input_text, axis=1)
 
-    processed_df = subset_df.copy()  # <-- STORE IT FOR LATER USE
-    # Return result
+    processed_df = subset_df.copy()
+
     return {
         "filename": file.filename,
         "num_rows": len(subset_df),
         "columns": subset_df.columns.tolist(),
-        "transformed": subset_df[["ClaimDescription", "DetailedClaimDescription", "Incurred","InputText", "SeverityLabel"]].to_dict(orient="records")
+        "transformed": subset_df[["ClaimDescription", "DetailedClaimDescription", "Incurred", "InputText", "SeverityLabel"]].to_dict(orient="records")
     }
 
 from sklearn.model_selection import train_test_split
@@ -317,17 +321,18 @@ from transformers import (
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support
 
 class ClaimDataset(torch.utils.data.Dataset):
-    def _init_(self, encodings, labels):
+    def __init__(self, encodings, labels):
         self.encodings = encodings
         self.labels = labels
 
-    def _getitem_(self, idx):
-        return {
-            key: torch.tensor(val[idx]) for key, val in self.encodings.items()
-        } | {"labels": torch.tensor(self.labels[idx])}
+    def __getitem__(self, idx):
+        item = {key: torch.tensor(val[idx]) for key, val in self.encodings.items()}
+        item["labels"] = torch.tensor(self.labels[idx])
+        return item
 
-    def _len_(self):
+    def __len__(self):
         return len(self.labels)
+
 
 def compute_metrics(eval_pred):
     logits, labels = eval_pred
@@ -336,17 +341,32 @@ def compute_metrics(eval_pred):
     acc = accuracy_score(labels, preds)
     return {"accuracy": acc, "f1": f1, "precision": precision, "recall": recall}
 
+import os
+from pathlib import Path
+
+MODEL_DIR = "saved_models/roberta"
+LABEL_ENCODER_PATH = "saved_models/label_encoder.pkl"
+
 @app.post("/train-model/")
-def train_model():
+def train_model(force_retrain: bool = False):
     global processed_df
 
     if processed_df.empty or "InputText" not in processed_df.columns or "SeverityLabel" not in processed_df.columns:
         raise HTTPException(status_code=400, detail="Processed data not found. Upload and process CSV first.")
 
+    # If model already exists and retraining is not forced
+    if not force_retrain and os.path.exists(MODEL_DIR) and os.path.exists(LABEL_ENCODER_PATH):
+        return {"status": "Model already exists. Use 'force_retrain=true' to retrain."}
+
     df = processed_df.copy()
     label_encoder = LabelEncoder()
     df["SeverityEncoded"] = label_encoder.fit_transform(df["SeverityLabel"])
     num_labels = len(label_encoder.classes_)
+
+    # Save label encoder
+    os.makedirs(os.path.dirname(LABEL_ENCODER_PATH), exist_ok=True)
+    with open(LABEL_ENCODER_PATH, "wb") as f:
+        pickle.dump(label_encoder, f)
 
     train_texts, val_texts, train_labels, val_labels = train_test_split(
         df["InputText"].tolist(),
@@ -367,8 +387,8 @@ def train_model():
     model = RobertaForSequenceClassification.from_pretrained("roberta-base", config=config)
 
     training_args = TrainingArguments(
-        output_dir="./roberta-severity-model",
-        evaluation_strategy="epoch",
+        output_dir=MODEL_DIR,
+        eval_strategy="epoch",
         save_strategy="epoch",
         per_device_train_batch_size=8,
         per_device_eval_batch_size=8,
@@ -377,6 +397,8 @@ def train_model():
         weight_decay=0.01,
         load_best_model_at_end=True,
         metric_for_best_model="f1",
+        save_total_limit=1,
+        logging_dir=os.path.join(MODEL_DIR, "logs"),
     )
 
     trainer = Trainer(
@@ -390,10 +412,86 @@ def train_model():
 
     train_output = trainer.train()
 
+    # Save model and tokenizer
+    model.save_pretrained(MODEL_DIR)
+    tokenizer.save_pretrained(MODEL_DIR)
+
     return {
-        "status": "training completed",
-        "metrics": train_output.metrics
+        "status": "training completed and model saved",
+        "metrics": train_output.metrics,
+        "model_path": MODEL_DIR
     }
+
+from fastapi import UploadFile, File, HTTPException
+import os, zipfile, shutil, pickle
+from transformers import RobertaForSequenceClassification, RobertaTokenizer
+
+MODEL_UPLOAD_DIR = "uploaded_model"
+LABEL_ENCODER_FILENAME = "label_encoder.pkl"
+
+def find_model_directory(base_dir: str) -> str:
+    """
+    Recursively search for a directory containing 'config.json' and either 
+    'pytorch_model.bin' or 'model.safetensors'.
+    """
+    for root, dirs, files in os.walk(base_dir):
+        if "config.json" in files and ("pytorch_model.bin" in files or "model.safetensors" in files):
+            return root
+    raise FileNotFoundError("No valid model directory found with config and model weights.")
+
+@app.post("/load-model/")
+async def load_model(model_zip: UploadFile = File(...)):
+    if not model_zip.filename.endswith(".zip"):
+        raise HTTPException(status_code=400, detail="Only ZIP files are accepted.")
+
+    # Save uploaded zip temporarily
+    zip_path = "temp_model.zip"
+    with open(zip_path, "wb") as f:
+        f.write(await model_zip.read())
+
+    # Clean old model directory
+    if os.path.exists(MODEL_UPLOAD_DIR):
+        shutil.rmtree(MODEL_UPLOAD_DIR)
+    os.makedirs(MODEL_UPLOAD_DIR, exist_ok=True)
+
+    # Extract the zip
+    try:
+        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+            zip_ref.extractall(MODEL_UPLOAD_DIR)
+    except zipfile.BadZipFile:
+        raise HTTPException(status_code=400, detail="Invalid zip file.")
+
+    # Try to locate model directory inside uploaded content
+    try:
+        model_dir = find_model_directory(MODEL_UPLOAD_DIR)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    # Load model and tokenizer
+    try:
+        model = RobertaForSequenceClassification.from_pretrained(model_dir)
+        tokenizer = RobertaTokenizer.from_pretrained(model_dir)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to load model/tokenizer: {e}")
+
+    # Load label encoder
+    label_encoder_path = os.path.join(model_dir, LABEL_ENCODER_FILENAME)
+    if not os.path.exists(label_encoder_path):
+        raise HTTPException(status_code=400, detail=f"{LABEL_ENCODER_FILENAME} not found in model directory.")
+
+    try:
+        with open(label_encoder_path, "rb") as f:
+            label_encoder = pickle.load(f)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to load label encoder: {e}")
+
+    return {
+        "status": "Model loaded successfully.",
+        "model_dir": model_dir,
+        "labels": list(label_encoder.classes_)
+    }
+
+
 
 
 from fastapi import UploadFile, File, HTTPException, FastAPI
